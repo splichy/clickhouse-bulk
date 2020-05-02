@@ -1,21 +1,27 @@
 package main
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/nikepan/go-datastructures/queue"
 )
 
 // ClickhouseServer - clickhouse server instance object struct
 type ClickhouseServer struct {
 	URL         string
+	Host        string
 	LastRequest time.Time
 	Bad         bool
 	Client      *http.Client
@@ -51,7 +57,7 @@ func NewClickhouse(downTimeout int, connectTimeout int) (c *Clickhouse) {
 	c = new(Clickhouse)
 	c.DownTimeout = downTimeout
 	c.ConnectTimeout = connectTimeout
-	if c.ConnectTimeout < 0 {
+	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 10
 	}
 	c.Servers = make([]*ClickhouseServer, 0)
@@ -61,12 +67,74 @@ func NewClickhouse(downTimeout int, connectTimeout int) (c *Clickhouse) {
 }
 
 // AddServer - add clickhouse server url
-func (c *Clickhouse) AddServer(url string) {
+func (c *Clickhouse) AddServer(urlIn string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.Servers = append(c.Servers, &ClickhouseServer{URL: url, Client: &http.Client{
-		Timeout: time.Second * time.Duration(c.ConnectTimeout),
-	}})
+	serverIps, host, _ := resolveServer(urlIn)
+	if serverIps != nil {
+		for _, serverIP := range serverIps {
+			urlWithIP, _ := url.Parse(urlIn)
+			urlWithIP.Host = serverIP.String() + ":" + urlWithIP.Port()
+			tlsConfig := tls.Config{
+				ServerName: host,
+			}
+			tr := &http.Transport{
+				TLSClientConfig: &tlsConfig,
+			}
+			c.Servers = append(c.Servers, &ClickhouseServer{URL: urlWithIP.String(), Host: host, Client: &http.Client{
+				Timeout: time.Second * time.Duration(c.ConnectTimeout), Transport: tr,
+			}})
+		}
+	} else {
+		c.Servers = append(c.Servers, &ClickhouseServer{URL: urlIn, Client: &http.Client{
+			Timeout: time.Second * time.Duration(c.ConnectTimeout),
+		}})
+	}
+}
+
+func resolveServer(urlIn string) (ips []net.IP, host string, ttl uint32) {
+	if host, err := url.Parse(urlIn); err == nil {
+		h := host.Hostname()
+		i := net.ParseIP(h)
+		if i != nil { // it's IP so return just IP with TTL 0
+			out := make([]net.IP, 1)
+			out[0] = i
+			return out, h, 0
+		}
+		conf, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		if err != nil {
+			fmt.Println(err)
+		}
+		nameserver := conf.Servers[0]
+		port := 53
+		if i := net.ParseIP(nameserver); i != nil {
+			nameserver = net.JoinHostPort(nameserver, strconv.Itoa(port))
+		} else {
+			nameserver = dns.Fqdn(nameserver) + ":" + strconv.Itoa(port)
+		}
+		m := new(dns.Msg)
+		m.Id = dns.Id()
+		m.RecursionDesired = true
+		m.Question = make([]dns.Question, 1)
+		m.Question[0] = dns.Question{dns.Fqdn(h), dns.TypeA, dns.ClassINET}
+		c := new(dns.Client)
+		if in, rtt, err := c.Exchange(m, nameserver); err == nil {
+			var out []net.IP
+			var ttl uint32
+			for _, ans := range in.Answer {
+				if a, ok := ans.(*dns.A); ok {
+					out = append(out, a.A.To4())
+				}
+				ttl = ans.Header().Ttl
+			}
+			log.Printf("INFO: resolved (%+v) in %+v to IPs: %+v\n", h, rtt, out)
+			return out, h, ttl
+		}
+	} else {
+		log.Fatal(err)
+		return nil, "", 0
+	}
+	return nil, "", 0
 }
 
 // DumpServers - dump servers state to prometheus
@@ -180,7 +248,9 @@ func (srv *ClickhouseServer) SendQuery(r *ClickhouseRequest) (response string, s
 			url += "?" + r.Params
 		}
 		log.Printf("INFO: send %+v rows to %+v of %+v\n", r.Count, srv.URL, r.Query)
-		resp, err := srv.Client.Post(url, "", strings.NewReader(r.Content))
+		req, err := http.NewRequest("POST", url, strings.NewReader(r.Content))
+		req.Header.Set("Host", srv.Host)
+		resp, err := srv.Client.Do(req)
 		if err != nil {
 			srv.Bad = true
 			return err.Error(), http.StatusBadGateway, ErrServerIsDown
